@@ -45,4 +45,4 @@ npm run typecheck
 npm run build
 ```
 
-产品需求见 `docs/PRODUCT.md`，模块归属与 HTTP 契约见 `docs/COORDINATION.md`。
+产品需求见 `docs/PRODUCT.md`，历史 HTTP 契约见 `docs/API_CONTRACT.md`。
