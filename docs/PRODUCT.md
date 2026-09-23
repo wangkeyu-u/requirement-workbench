@@ -166,7 +166,7 @@ Demo 必须首先可以通过 MockProvider 完整运行。
 AUTO REPLY: ON / OFF
 ```
 
-默认可以开启 Auto Reply。
+Mock 演示默认开启 Auto Reply；首次启用真实邮箱时默认关闭，由用户在界面主动开启。手动发送回复不受 Auto Reply 开关限制。
 
 当 Auto Reply 开启时：
 

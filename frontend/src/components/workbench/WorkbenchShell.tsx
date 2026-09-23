@@ -19,7 +19,16 @@ import {
   type ThreadDetail,
   type ThreadStatus,
 } from '../../lib/api';
-import { categoryLabel, fieldLabel, STATUS_HELP, STATUS_LABELS } from '../../lib/i18n';
+import {
+  categoryLabel,
+  errorLabel,
+  fieldLabel,
+  outboundMailLabel,
+  replyActionLabel,
+  replyStatusLabel,
+  STATUS_HELP,
+  STATUS_LABELS,
+} from '../../lib/i18n';
 import styles from './WorkbenchShell.module.css';
 
 export interface WorkbenchShellProps {
@@ -29,7 +38,7 @@ export interface WorkbenchShellProps {
 }
 
 type ViewMode = 'ai' | 'requirement';
-type ActionKey = 'analyze' | 'answer' | 'reply' | 'thread-guard' | 'email-guard' | 'settings';
+type ActionKey = 'analyze' | 'answer' | 'reply' | 'resolve-reply' | 'thread-guard' | 'email-guard' | 'settings';
 
 const SIGNAL_FIELDS: Array<{
   key: keyof Requirement;
@@ -45,9 +54,7 @@ const SIGNAL_FIELDS: Array<{
 ];
 
 function errorMessage(error: unknown): string {
-  const message = error instanceof Error ? error.message : '';
-  if (/failed to fetch|networkerror|load failed/i.test(message)) return '无法连接本地服务，请确认后端已启动。';
-  return message || '连接本地工作台时发生错误。';
+  return errorLabel(error, '连接本地工作台时发生错误，请重试。');
 }
 
 function hasContent(value: unknown): boolean {
@@ -64,6 +71,11 @@ function hasContent(value: unknown): boolean {
 function getDefaultEmailId(emails: Email[]): string {
   const inbound = emails.filter((email) => email.direction === 'inbound');
   return (inbound[inbound.length - 1] ?? emails[emails.length - 1])?.id ?? '';
+}
+
+function latestReplyStatus(detail: ThreadDetail): string | null {
+  const latestReply = detail.reply_log[detail.reply_log.length - 1];
+  return latestReply?.status.trim().toLowerCase() ?? null;
 }
 
 function formatDate(value: string): string {
@@ -84,16 +96,6 @@ function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function replyStatusLabel(status: string): string {
-  const labels: Record<string, string> = {
-    sent: '已发送',
-    simulated: '已模拟',
-    delivered: '已送达',
-    recorded: '已记录',
-  };
-  return labels[status.toLowerCase()] ?? '已记录';
 }
 
 function initials(value: string): string {
@@ -300,10 +302,12 @@ function AttachmentList({ attachments, onOpen, onDownload }: {
 
 function ThreadRail({
   detail,
+  mailProvider,
   selectedEmailId,
   onSelect,
 }: {
   detail: ThreadDetail;
+  mailProvider: string;
   selectedEmailId: string;
   onSelect: (id: string) => void;
 }) {
@@ -342,7 +346,7 @@ function ThreadRail({
                 <strong>{email.direction === 'outbound' ? '你' : email.sender}</strong>
                 <span className={styles.emailSubject}>{email.subject}</span>
                 <span className={styles.emailItemFooter}>
-                  <span>{email.direction === 'outbound' ? '已发送回复' : email.sender_email}</span>
+                  <span>{email.direction === 'outbound' ? outboundMailLabel(mailProvider) : email.sender_email}</span>
                   {email.attachments.length ? <span className={styles.attachmentCount}><Icon name="paperclip" size={12} />{email.attachments.length}</span> : null}
                   {email.do_not_reply ? <span className={styles.guardBadge}><Icon name="shield" size={12} /> 已禁止回复</span> : null}
                 </span>
@@ -368,12 +372,14 @@ function ThreadRail({
 
 function EmailPanel({
   email,
+  mailProvider,
   onToggleNoReply,
   onOpenAttachment,
   onDownloadAttachment,
   busy,
 }: {
   email: Email | undefined;
+  mailProvider: string;
   onToggleNoReply: (email: Email) => void;
   onOpenAttachment: (attachment: Attachment) => void;
   onDownloadAttachment: (attachment: Attachment) => void;
@@ -396,7 +402,7 @@ function EmailPanel({
   return (
     <section className={`${styles.panel} ${styles.emailPanel}`} aria-label="邮件详情">
       <div className={styles.panelHeader}>
-        <PanelLabel trailing={email.direction === 'outbound' ? '发出' : '收到'}>邮件</PanelLabel>
+        <PanelLabel trailing={email.direction === 'outbound' ? outboundMailLabel(mailProvider) : '收到'}>邮件</PanelLabel>
       </div>
 
       <div className={styles.emailScroll}>
@@ -410,7 +416,7 @@ function EmailPanel({
             <p>{email.sender_email}</p>
           </div>
           <span className={`${styles.directionChip} ${email.direction === 'outbound' ? styles.directionOutbound : ''}`}>
-            {email.direction === 'outbound' ? '已发送' : '已收到'}
+            {email.direction === 'outbound' ? outboundMailLabel(mailProvider) : '已收到'}
           </span>
         </div>
 
@@ -621,6 +627,7 @@ function EmployeePanel({
   onAnswer,
   onAnalyze,
   onReply,
+  onResolveReply,
   onCopyMarkdown,
   onDownloadMarkdown,
   onRetryMarkdown,
@@ -640,6 +647,7 @@ function EmployeePanel({
   onAnswer: (event: FormEvent<HTMLFormElement>) => void;
   onAnalyze: () => void;
   onReply: () => void;
+  onResolveReply: (delivered: boolean) => void;
   onCopyMarkdown: () => void;
   onDownloadMarkdown: () => void;
   onRetryMarkdown: () => void;
@@ -661,6 +669,7 @@ function EmployeePanel({
   const risks = detail.requirement.risks.filter(hasContent);
   const openQuestions = detail.requirement.open_questions.filter(hasContent);
   const missingItems = missingFields.slice(0, 5);
+  const replyResultUncertain = latestReplyStatus(detail) === 'uncertain';
   if (openQuestions.length) missingItems.push(`${openQuestions.length} 个待确认问题`);
 
   return (
@@ -713,7 +722,7 @@ function EmployeePanel({
             </button>
             <button className={styles.primaryButton} type="button" onClick={onReply} disabled={busyAction !== null || Boolean(replyDisabledReason)} title={replyDisabledReason ?? undefined}>
               <Icon name="send" size={15} />
-              {busyAction === 'reply' ? '正在模拟……' : '模拟回复'}
+              {replyActionLabel(settings.mail_provider, busyAction === 'reply')}
             </button>
           </div>
           {replyDisabledReason ? <p className={styles.actionHint}>{replyDisabledReason}</p> : null}
@@ -724,9 +733,22 @@ function EmployeePanel({
                 <p className={styles.subLabel}>回复记录</p>
                 <span>{String(detail.reply_log.length).padStart(2, '0')}</span>
               </div>
+              {replyResultUncertain ? (
+                <>
+                  <p className={styles.actionHint}>发送结果待确认，请先查看邮箱发件箱</p>
+                  <div className={styles.employeeActions}>
+                    <button className={styles.secondaryButton} type="button" onClick={() => onResolveReply(true)} disabled={busyAction !== null}>
+                      {busyAction === 'resolve-reply' ? '正在确认……' : '确认已发送'}
+                    </button>
+                    <button className={styles.primaryButton} type="button" onClick={() => onResolveReply(false)} disabled={busyAction !== null}>
+                      {busyAction === 'resolve-reply' ? '正在确认……' : '确认未发送，允许重试'}
+                    </button>
+                  </div>
+                </>
+              ) : null}
               {detail.reply_log.slice().reverse().map((reply) => (
                 <div className={styles.replyRow} key={reply.id}>
-                  <span className={styles.replyStatus}>{replyStatusLabel(reply.status)}</span>
+                  <span className={styles.replyStatus}>{replyStatusLabel(reply.status, settings.mail_provider)}</span>
                   <p>{reply.body}</p>
                   <time>{formatDate(reply.created_at)}</time>
                 </div>
@@ -800,11 +822,26 @@ export default function WorkbenchShell({ threadId, onClose, onUpdated }: Workben
       return nextDetail;
     } catch (error) {
       setActionError(errorMessage(error));
+      const mayHaveAttemptedRealSend = settings?.mail_provider !== 'mock'
+        && /^Mail provider error:/i.test(error instanceof Error ? error.message : '');
+      if (mayHaveAttemptedRealSend) {
+        retryActionRef.current = null;
+        try {
+          const latestDetail = await api.thread(threadId);
+          setDetail(latestDetail);
+          setSelectedEmailId((current) => latestDetail.emails.some((email) => email.id === current) ? current : getDefaultEmailId(latestDetail.emails));
+          setMarkdown(null);
+          setMarkdownError(null);
+          onUpdated?.();
+        } catch {
+          // Keep the original send error visible when the follow-up read also fails.
+        }
+      }
       return null;
     } finally {
       setBusyAction(null);
     }
-  }, [onUpdated]);
+  }, [onUpdated, settings?.mail_provider, threadId]);
 
   const runEmailGuardAction = useCallback(async (emailId: string, nextValue: boolean) => {
     setBusyAction('email-guard');
@@ -885,12 +922,15 @@ export default function WorkbenchShell({ threadId, onClose, onUpdated }: Workben
     if (!detail || !settings) return '正在加载回复设置。';
     if (detail.thread.do_not_reply) return '线程保护已开启，无法回复。';
     if (detail.emails.some((email) => email.do_not_reply) || detail.thread.status === 'do_not_reply') return '这条线程中的消息已开启回复保护。';
-    if (settings.auto_reply === false) return '请先打开“自动回复”，才能模拟发送。';
-    if (detail.thread.status === 'replied') return '这条线程已经模拟回复过了。';
+    const latestStatus = latestReplyStatus(detail);
+    if (latestStatus === 'sending') return '正在发送，请稍后刷新确认';
+    if (latestStatus === 'uncertain') return '发送结果待确认，请先查看邮箱发件箱';
+    if (detail.thread.status === 'replied') return settings.mail_provider === 'mock' ? '这条线程已经模拟回复过了。' : '这条线程已经发送过邮件，无法重复发送。';
     if (detail.thread.status === 'no_action') return '这条线程标记为无需处理。';
     if (detail.thread.category !== 'requirement') return '这条线程不是需求。';
     if (detail.question) return '请先回答待确认问题。';
     if (detail.requirement.completeness < 75) return '需求还需要更多已确认信息才能回复。';
+    if (settings.mail_provider !== 'mock' && !detail.thread.id.startsWith('mail-thread-')) return '真实邮箱模式只允许回复从邮箱同步的线程；演示线程不能发送邮件。';
     return null;
   }, [detail, settings]);
 
@@ -898,6 +938,15 @@ export default function WorkbenchShell({ threadId, onClose, onUpdated }: Workben
     if (!detail || busyAction || replyDisabledReason) return;
     void runDetailAction('reply', () => api.reply(detail.thread.id));
   }, [busyAction, detail, replyDisabledReason, runDetailAction]);
+
+  const handleResolveReply = useCallback((delivered: boolean) => {
+    if (!detail || busyAction) return;
+    void runDetailAction('resolve-reply', async () => {
+      const nextDetail = await api.resolveReply(detail.thread.id, delivered);
+      retryActionRef.current = null;
+      return nextDetail;
+    });
+  }, [busyAction, detail, runDetailAction]);
 
   const handleThreadGuard = useCallback(() => {
     if (!detail || busyAction) return;
@@ -1040,15 +1089,16 @@ export default function WorkbenchShell({ threadId, onClose, onUpdated }: Workben
         <div className={styles.actionError} role="alert">
           <span className={styles.errorMarkSmall}>!</span>
           <span>{actionError}</span>
-          <button type="button" onClick={() => retryActionRef.current?.()}><Icon name="refresh" size={14} /> 重试</button>
+          {retryActionRef.current ? <button type="button" onClick={() => retryActionRef.current?.()}><Icon name="refresh" size={14} /> 重试</button> : null}
           <button type="button" className={styles.dismissError} onClick={() => setActionError(null)} aria-label="关闭错误提示"><Icon name="x" size={14} /></button>
         </div>
       ) : null}
 
       <main className={styles.workbenchGrid}>
-        <ThreadRail detail={detail} selectedEmailId={selectedEmailId} onSelect={setSelectedEmailId} />
+        <ThreadRail detail={detail} mailProvider={settings.mail_provider} selectedEmailId={selectedEmailId} onSelect={setSelectedEmailId} />
         <EmailPanel
           email={selectedEmail}
+          mailProvider={settings.mail_provider}
           busy={busyAction === 'email-guard'}
           onToggleNoReply={handleEmailGuard}
           onOpenAttachment={handleAttachmentOpen}
@@ -1064,6 +1114,7 @@ export default function WorkbenchShell({ threadId, onClose, onUpdated }: Workben
           onAnswer={handleAnswer}
           onAnalyze={handleAnalyze}
           onReply={handleReply}
+          onResolveReply={handleResolveReply}
           onCopyMarkdown={() => { void handleCopyMarkdown(); }}
           onDownloadMarkdown={() => { void handleDownloadMarkdown(); }}
           onRetryMarkdown={retryMarkdown}

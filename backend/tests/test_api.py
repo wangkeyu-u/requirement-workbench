@@ -227,6 +227,34 @@ class WorkbenchApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertFalse(persisted["auto_reply"])
 
+    def test_real_mailbox_starts_with_auto_reply_off_and_preserves_explicit_choice(self) -> None:
+        # An existing demo setting must not silently authorize SMTP on provider switch.
+        with patch.dict(os.environ, {"MAIL_PROVIDER": "imap"}, clear=False):
+            real_app = create_app(self.database_path)
+            status, _, settings = request(real_app, "GET", "/api/settings")
+            self.assertEqual(status, 200)
+            self.assertFalse(settings["auto_reply"])
+            status, _, _ = request(real_app, "PATCH", "/api/settings", {"auto_reply": True})
+            self.assertEqual(status, 200)
+            restarted = create_app(self.database_path)
+            status, _, persisted = request(restarted, "GET", "/api/settings")
+            self.assertEqual(status, 200)
+            self.assertTrue(persisted["auto_reply"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"MAIL_PROVIDER": "imap"}, clear=False):
+                fresh_app = create_app(Path(directory) / "fresh.sqlite3")
+                status, _, fresh_settings = request(fresh_app, "GET", "/api/settings")
+                self.assertEqual(status, 200)
+                self.assertFalse(fresh_settings["auto_reply"])
+
+    def test_manual_mock_reply_works_with_auto_reply_off(self) -> None:
+        status, _, _ = request(self.app, "PATCH", "/api/settings", {"auto_reply": False})
+        self.assertEqual(status, 200)
+        status, _, detail = request(self.app, "POST", "/api/threads/thread-customer-export/reply")
+        self.assertEqual(status, 200)
+        self.assertEqual(detail["thread"]["status"], "replied")
+
     def test_auto_reply_runs_after_answer_when_ready(self) -> None:
         self._make_performance_thread_one_question_away()
         status, _, answered = request(
@@ -569,6 +597,81 @@ class WorkbenchApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(len(detail["reply_log"]), 1)
 
+    def test_unknown_send_result_requires_manual_resolution_before_retry(self) -> None:
+        class UncertainMailbox:
+            label = "mock"
+
+            def send_message(self, *, thread: dict[str, Any], recipient: str, subject: str, body: str) -> str:
+                raise RuntimeError("connection dropped after send")
+
+        with patch("backend.service.resolve_mail_provider", return_value=UncertainMailbox()):
+            status, _, error = request(self.app, "POST", "/api/threads/thread-customer-export/reply")
+        self.assertEqual(status, 502)
+        self.assertIn("unknown", error["detail"])
+        status, _, detail = request(self.app, "GET", "/api/threads/thread-customer-export")
+        self.assertEqual(detail["reply_log"][0]["status"], "uncertain")
+        status, _, blocked = request(self.app, "POST", "/api/threads/thread-customer-export/reply")
+        self.assertEqual(status, 409)
+        self.assertIn("Confirm whether", blocked["detail"])
+
+        status, _, resolved = request(
+            self.app,
+            "POST",
+            "/api/threads/thread-customer-export/reply/resolve",
+            {"delivered": False},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(resolved["reply_log"], [])
+        status, _, retried = request(self.app, "POST", "/api/threads/thread-customer-export/reply")
+        self.assertEqual(status, 200)
+        self.assertEqual(retried["thread"]["status"], "replied")
+
+    def test_confirming_uncertain_reply_records_it_once(self) -> None:
+        class UncertainMailbox:
+            label = "mock"
+
+            def send_message(self, *, thread: dict[str, Any], recipient: str, subject: str, body: str) -> str:
+                raise RuntimeError("connection dropped after send")
+
+        with patch("backend.service.resolve_mail_provider", return_value=UncertainMailbox()):
+            status, _, _ = request(self.app, "POST", "/api/threads/thread-customer-export/reply")
+        self.assertEqual(status, 502)
+        status, _, resolved = request(
+            self.app,
+            "POST",
+            "/api/threads/thread-customer-export/reply/resolve",
+            {"delivered": True},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(resolved["thread"]["status"], "replied")
+        self.assertEqual(resolved["reply_log"][0]["status"], "sent")
+        self.assertEqual(len([email for email in resolved["emails"] if email["direction"] == "outbound"]), 1)
+        status, _, _ = request(
+            self.app,
+            "POST",
+            "/api/threads/thread-customer-export/reply/resolve",
+            {"delivered": True},
+        )
+        self.assertEqual(status, 409)
+
+    def test_stale_sending_reply_becomes_uncertain_on_detail_read(self) -> None:
+        with self.app.state.database.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO replies(id, thread_id, body, status, created_at, body_hash, provider_message_id)
+                VALUES ('reply-stale', 'thread-customer-export', 'Draft', 'sending',
+                        '2020-01-01T00:00:00+00:00', 'stale-hash', NULL)
+                """
+            )
+        status, _, detail = request(self.app, "GET", "/api/threads/thread-customer-export")
+        self.assertEqual(status, 200)
+        self.assertEqual(detail["reply_log"][0]["status"], "uncertain")
+        with self.app.state.database.connection() as conn:
+            saved_status = conn.execute(
+                "SELECT status FROM replies WHERE id = 'reply-stale'"
+            ).fetchone()["status"]
+        self.assertEqual(saved_status, "uncertain")
+
     def test_mail_send_happens_outside_sqlite_write_transaction(self) -> None:
         self._make_performance_thread_one_question_away()
         database_path = str(self.database_path)
@@ -627,28 +730,43 @@ class WorkbenchApiTests(unittest.TestCase):
             body="Please export the weekly metrics.",
             received_at="2026-09-14T04:00:00+00:00",
             attachments=(IncomingAttachment("metrics.csv", "text/csv", b"week,total\n1,42\n"),),
+            mailbox_uid="42",
         )
 
         class FakeMailbox:
             label = "imap/smtp"
+            seen_uids: list[str] = []
 
             def fetch_messages(self) -> list[IncomingMail]:
                 return [incoming]
 
+            def mark_messages_seen(self, uids: list[str]) -> None:
+                with sqlite3.connect(self_database_path) as probe:
+                    self.assert_committed_count = probe.execute(
+                        "SELECT COUNT(*) FROM emails WHERE id = ?",
+                        (self_email_id,),
+                    ).fetchone()[0]
+                self.seen_uids.extend(uids)
+
             def send_message(self, **_: Any) -> str:
                 return "unused"
 
+        self_database_path = str(self.database_path)
+        self_email_id = self.app.state.service._mail_email_id(incoming, "imap")
+        mailbox = FakeMailbox()
         with patch.dict(os.environ, {"MAIL_PROVIDER": "imap"}, clear=False):
             app = create_app(self.database_path)
-            with patch("backend.service.resolve_mail_provider", return_value=FakeMailbox()):
+            with patch("backend.service.resolve_mail_provider", return_value=mailbox):
                 status, _, first = request(app, "POST", "/api/mail/sync")
                 self.assertEqual(status, 200)
                 self.assertEqual(first["imported"], 1)
                 self.assertEqual(first["threads"], 1)
+                self.assertEqual(mailbox.assert_committed_count, 1)
                 status, _, second = request(app, "POST", "/api/mail/sync")
                 self.assertEqual(status, 200)
                 self.assertEqual(second["imported"], 0)
                 self.assertEqual(second["skipped"], 1)
+                self.assertEqual(mailbox.seen_uids, ["42", "42"])
 
         thread_id = app.state.service._mail_thread_id(incoming)
         status, _, detail = request(app, "GET", f"/api/threads/{thread_id}")
@@ -657,6 +775,66 @@ class WorkbenchApiTests(unittest.TestCase):
         self.assertEqual(detail["emails"][0]["body"], incoming.body)
         self.assertEqual(detail["emails"][0]["attachments"][0]["filename"], "metrics.csv")
         self.assertEqual(detail["emails"][0]["attachments"][0]["size"], len(b"week,total\n1,42\n"))
+        with app.state.database.connection() as conn:
+            saved_message_id = conn.execute(
+                "SELECT message_id FROM emails WHERE id = ?", (self_email_id,)
+            ).fetchone()["message_id"]
+        self.assertEqual(saved_message_id, incoming.message_key)
+
+    def test_smtp_reply_includes_original_message_references(self) -> None:
+        sent_messages: list[EmailMessage] = []
+
+        class FakeSMTP:
+            def __init__(self, *_: Any, **__: Any) -> None:
+                pass
+
+            def __enter__(self) -> "FakeSMTP":
+                return self
+
+            def __exit__(self, *_: Any) -> None:
+                pass
+
+            def login(self, *_: Any) -> None:
+                pass
+
+            def send_message(self, message: EmailMessage) -> None:
+                sent_messages.append(message)
+
+        with patch.dict(os.environ, {
+            "MAIL_SMTP_HOST": "smtp.example.com",
+            "MAIL_FROM": "me@example.com",
+            "MAIL_USERNAME": "me@example.com",
+            "MAIL_PASSWORD": "test-password",
+        }, clear=False), patch("backend.providers.smtplib.SMTP_SSL", FakeSMTP):
+            provider = IMAPSMTPMailProvider()
+            provider.send_message(
+                thread={
+                    "reply_to_message_id": "<latest@example.com>",
+                    "references": ["<root@example.com>", "<latest@example.com>"],
+                },
+                recipient="ada@example.com",
+                subject="Re: Weekly metrics",
+                body="Thanks for the details.",
+            )
+        self.assertEqual(len(sent_messages), 1)
+        self.assertEqual(sent_messages[0]["In-Reply-To"], "<latest@example.com>")
+        self.assertEqual(sent_messages[0]["References"], "<root@example.com> <latest@example.com>")
+
+    def test_existing_mail_database_gains_message_id_column(self) -> None:
+        legacy_path = Path(self.temp_dir.name) / "legacy.sqlite3"
+        with sqlite3.connect(legacy_path) as conn:
+            conn.execute(
+                """CREATE TABLE emails (
+                    id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, sender TEXT NOT NULL,
+                    sender_email TEXT NOT NULL, subject TEXT NOT NULL, body TEXT NOT NULL,
+                    received_at TEXT NOT NULL, direction TEXT NOT NULL,
+                    do_not_reply INTEGER NOT NULL DEFAULT 0
+                )"""
+            )
+        legacy_app = create_app(legacy_path)
+        with legacy_app.state.database.connection() as conn:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(emails)")}
+        self.assertIn("message_id", columns)
 
     def test_real_mail_parser_keeps_body_and_attachment_metadata(self) -> None:
         message = EmailMessage()
@@ -677,6 +855,93 @@ class WorkbenchApiTests(unittest.TestCase):
         self.assertIn("original message body", parsed.body)
         self.assertEqual(parsed.attachments[0].filename, "metrics.csv")
         self.assertEqual(parsed.attachments[0].content, b"week,total\n1,42\n")
+
+    def test_real_mail_parser_groups_root_and_replies_by_message_id(self) -> None:
+        root = EmailMessage()
+        root["Message-ID"] = "<root@example.com>"
+        root["Subject"] = "Request: Weekly metrics"
+        root.set_content("First message")
+        reply = EmailMessage()
+        reply["Message-ID"] = "<reply@example.com>"
+        reply["References"] = "<root@example.com>"
+        reply["In-Reply-To"] = "<root@example.com>"
+        reply["Subject"] = "Re: Request: Weekly metrics"
+        reply.set_content("A follow-up")
+
+        root_mail = IMAPSMTPMailProvider._parse_message(root, "1")
+        reply_mail = IMAPSMTPMailProvider._parse_message(reply, "2")
+        self.assertEqual(root_mail.thread_key, "<root@example.com>")
+        self.assertEqual(reply_mail.thread_key, root_mail.thread_key)
+        self.assertEqual(
+            self.app.state.service._mail_thread_id(root_mail),
+            self.app.state.service._mail_thread_id(reply_mail),
+        )
+
+    def test_real_mailbox_blocks_demo_delivery_but_allows_explicit_real_reply(self) -> None:
+        incoming = IncomingMail(
+            message_key="<real-manual@example.com>",
+            thread_key="<real-manual@example.com>",
+            sender="Ada Lovelace",
+            sender_email="ada@example.com",
+            subject="Request: Weekly metrics",
+            body="Please send the weekly metrics.",
+            received_at="2026-09-14T04:00:00+00:00",
+        )
+
+        class RecordingMailbox:
+            label = "imap/smtp"
+            from_address = "owner@example.com"
+
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+                self.sent_thread: dict[str, Any] | None = None
+
+            def fetch_messages(self) -> list[IncomingMail]:
+                return [incoming]
+
+            def send_message(self, *, thread: dict[str, Any], recipient: str, subject: str, body: str) -> str:
+                self.sent.append(recipient)
+                self.sent_thread = thread
+                return "<recorded@example.com>"
+
+        mailbox = RecordingMailbox()
+        with patch.dict(os.environ, {"MAIL_PROVIDER": "imap"}, clear=False):
+            app = create_app(self.database_path)
+        with patch("backend.service.resolve_mail_provider", return_value=mailbox):
+            status, _, blocked = request(app, "POST", "/api/threads/thread-customer-export/reply")
+            self.assertEqual(status, 409)
+            self.assertIn("Demo threads", blocked["detail"])
+            self.assertEqual(mailbox.sent, [])
+
+            status, _, synced = request(app, "POST", "/api/mail/sync")
+            self.assertEqual(status, 200)
+            self.assertEqual(synced["imported"], 1)
+            thread_id = app.state.service._mail_thread_id(incoming)
+            with app.state.database.transaction() as conn:
+                row = conn.execute(
+                    "SELECT state_json FROM requirements WHERE thread_id = ?", (thread_id,)
+                ).fetchone()
+                state = json.loads(row["state_json"])
+                state["status"] = "ready"
+                state["completeness"] = 100
+                conn.execute(
+                    "UPDATE requirements SET state_json = ?, status = 'ready', completeness = 100 WHERE thread_id = ?",
+                    (json.dumps(state), thread_id),
+                )
+                conn.execute(
+                    "UPDATE threads SET status = 'ready', completeness = 100 WHERE id = ?",
+                    (thread_id,),
+                )
+            status, _, settings = request(app, "GET", "/api/settings")
+            self.assertFalse(settings["auto_reply"])
+            status, _, sent = request(
+                app, "POST", f"/api/threads/{thread_id}/reply", {"body": "Confirmed weekly metrics."}
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(mailbox.sent, ["ada@example.com"])
+            self.assertEqual(mailbox.sent_thread["reply_to_message_id"], incoming.message_key)
+            self.assertEqual(mailbox.sent_thread["references"], [incoming.message_key])
+            self.assertEqual(sent["thread"]["status"], "replied")
 
     def test_real_mail_sync_reports_missing_configuration(self) -> None:
         with patch.dict(

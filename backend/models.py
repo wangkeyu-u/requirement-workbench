@@ -252,6 +252,12 @@ class ReplyRequest(BaseModel):
     body: str | None = Field(default=None, min_length=1)
 
 
+class ReplyResolutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    delivered: bool
+
+
 class AnswerRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

@@ -73,6 +73,7 @@ class IncomingMail:
     body: str
     received_at: str
     attachments: tuple[IncomingAttachment, ...] = ()
+    mailbox_uid: str | None = None
 
 
 def _invalid_llm_output(path: str, message: str) -> LLMProviderError:
@@ -227,6 +228,8 @@ class MailProvider(Protocol):
     label: str
 
     def fetch_messages(self) -> list[IncomingMail]: ...
+
+    def mark_messages_seen(self, uids: list[str]) -> None: ...
 
     def send_message(
         self,
@@ -625,6 +628,9 @@ def _message_thread_key(subject: str, message: Message) -> str:
     in_reply_to = str(message.get("In-Reply-To", "")).strip()
     if in_reply_to:
         return in_reply_to
+    message_id = str(message.get("Message-ID", "")).strip()
+    if message_id:
+        return message_id
     normalized = re.sub(r"^(?:(?:re|fw|fwd):\s*)+", "", subject, flags=re.IGNORECASE).strip().lower()
     return f"subject:{normalized or 'untitled'}"
 
@@ -677,7 +683,7 @@ class IMAPSMTPMailProvider:
                 else imaplib.IMAP4(self.imap_host, self.imap_port, timeout=self.imap_timeout)
             )
             client.login(self.username, self.password)
-            status, _ = client.select(self.imap_folder, readonly=not self.imap_mark_seen)
+            status, _ = client.select(self.imap_folder, readonly=True)
             if status != "OK":
                 raise MailProviderError(f"Unable to open mailbox folder {self.imap_folder!r}")
             status, data = client.uid("search", None, self.imap_search)
@@ -698,13 +704,43 @@ class IMAPSMTPMailProvider:
                 message = BytesParser(policy=policy.default).parsebytes(raw_message)
                 parsed = self._parse_message(message, raw_uid.decode("ascii", errors="replace"))
                 messages.append(parsed)
-                if self.imap_mark_seen:
-                    client.uid("store", raw_uid, "+FLAGS", "\\Seen")
             return messages
         except MailProviderError:
             raise
         except (OSError, imaplib.IMAP4.error, UnicodeError, ValueError) as exc:
             raise MailProviderError(f"Mailbox sync failed: {exc}") from exc
+        finally:
+            if client is not None:
+                try:
+                    client.logout()
+                except (OSError, imaplib.IMAP4.error):
+                    pass
+
+    def mark_messages_seen(self, uids: list[str]) -> None:
+        """Acknowledge messages only after the service has committed them locally."""
+
+        if not self.imap_mark_seen or not uids:
+            return
+        self._check_imap_config()
+        client: imaplib.IMAP4 | imaplib.IMAP4_SSL | None = None
+        try:
+            client = (
+                imaplib.IMAP4_SSL(self.imap_host, self.imap_port, timeout=self.imap_timeout)
+                if self.imap_ssl
+                else imaplib.IMAP4(self.imap_host, self.imap_port, timeout=self.imap_timeout)
+            )
+            client.login(self.username, self.password)
+            status, _ = client.select(self.imap_folder, readonly=False)
+            if status != "OK":
+                raise MailProviderError(f"Unable to open mailbox folder {self.imap_folder!r}")
+            for uid in uids:
+                status, _ = client.uid("store", uid.encode("ascii"), "+FLAGS", "\\Seen")
+                if status != "OK":
+                    raise MailProviderError(f"Unable to mark mailbox UID {uid} as seen")
+        except MailProviderError:
+            raise
+        except (OSError, imaplib.IMAP4.error, UnicodeError, ValueError) as exc:
+            raise MailProviderError(f"Mailbox seen-state update failed: {exc}") from exc
         finally:
             if client is not None:
                 try:
@@ -743,6 +779,7 @@ class IMAPSMTPMailProvider:
             body=_message_body(message),
             received_at=_message_timestamp(message),
             attachments=tuple(attachments),
+            mailbox_uid=uid,
         )
 
     def send_message(
@@ -753,12 +790,22 @@ class IMAPSMTPMailProvider:
         subject: str,
         body: str,
     ) -> str:
-        del thread
         self._check_smtp_config()
         message = EmailMessage(policy=policy.SMTP)
         message["From"] = self.from_address
         message["To"] = recipient
         message["Subject"] = subject
+        reply_to = thread.get("reply_to_message_id")
+        if isinstance(reply_to, str) and re.fullmatch(r"<[^<>\s]+>", reply_to):
+            message["In-Reply-To"] = reply_to
+        references = thread.get("references")
+        if isinstance(references, list):
+            valid_references = [
+                item for item in references
+                if isinstance(item, str) and re.fullmatch(r"<[^<>\s]+>", item)
+            ]
+            if valid_references:
+                message["References"] = " ".join(valid_references)
         message_id = make_msgid()
         message["Message-ID"] = message_id
         message.set_content(body)
@@ -785,6 +832,9 @@ class MockMailProvider:
 
     def fetch_messages(self) -> list[IncomingMail]:
         return []
+
+    def mark_messages_seen(self, uids: list[str]) -> None:
+        del uids
 
     def send_message(
         self,

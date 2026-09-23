@@ -48,7 +48,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS settings (
         id INTEGER PRIMARY KEY CHECK (id = 1),
-        auto_reply INTEGER NOT NULL DEFAULT 1,
+        auto_reply INTEGER NOT NULL DEFAULT 0,
         llm_provider TEXT NOT NULL DEFAULT 'mock',
         mail_provider TEXT NOT NULL DEFAULT 'mock',
         updated_at TEXT NOT NULL
@@ -81,7 +81,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         body TEXT NOT NULL,
         received_at TEXT NOT NULL,
         direction TEXT NOT NULL CHECK (direction IN ('inbound', 'outbound')),
-        do_not_reply INTEGER NOT NULL DEFAULT 0
+        do_not_reply INTEGER NOT NULL DEFAULT 0,
+        message_id TEXT
     )
     """,
     """
@@ -213,6 +214,8 @@ class Database:
         with self.transaction() as conn:
             for statement in SCHEMA_STATEMENTS:
                 conn.execute(statement)
+            if "message_id" not in {row["name"] for row in conn.execute("PRAGMA table_info(emails)")}:
+                conn.execute("ALTER TABLE emails ADD COLUMN message_id TEXT")
             default_llm = os.getenv("LLM_PROVIDER", "mock").strip().lower() or "mock"
             default_mail = os.getenv("MAIL_PROVIDER", "mock").strip().lower() or "mock"
             conn.execute(
@@ -220,7 +223,7 @@ class Database:
                 INSERT OR IGNORE INTO settings(id, auto_reply, llm_provider, mail_provider, updated_at)
                 VALUES(1, ?, ?, ?, ?)
                 """,
-                (1, default_llm, default_mail, utc_now()),
+                (int(default_mail == "mock"), default_llm, default_mail, utc_now()),
             )
             # Provider selection is deployment configuration, while auto_reply is user state.
             # Sync an explicitly supplied provider env var even when this database already exists.
@@ -230,9 +233,20 @@ class Database:
                     (default_llm, utc_now()),
                 )
             if "MAIL_PROVIDER" in os.environ:
+                previous_mail = conn.execute(
+                    "SELECT mail_provider FROM settings WHERE id = 1"
+                ).fetchone()["mail_provider"]
+                # A saved demo preference must never start sending real mail
+                # merely because the mailbox provider changed in .env.
                 conn.execute(
-                    "UPDATE settings SET mail_provider = ?, updated_at = ? WHERE id = 1",
-                    (default_mail, utc_now()),
+                    """
+                    UPDATE settings
+                    SET mail_provider = ?,
+                        auto_reply = CASE WHEN ? <> ? AND ? <> 'mock' THEN 0 ELSE auto_reply END,
+                        updated_at = ?
+                    WHERE id = 1
+                    """,
+                    (default_mail, previous_mail, default_mail, default_mail, utc_now()),
                 )
 
         self._seed_demo_data()

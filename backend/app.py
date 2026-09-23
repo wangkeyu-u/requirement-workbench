@@ -17,6 +17,7 @@ from .models import (
     MarkdownResponse,
     OkResponse,
     ReplyRequest,
+    ReplyResolutionRequest,
     Settings,
     SettingsPatch,
     Thread,
@@ -99,6 +100,10 @@ def create_app(database_path: str | Path | None = None) -> FastAPI:
     @app.post("/api/threads/{thread_id}/reply", response_model=ThreadDetail)
     def reply_thread(thread_id: str, payload: ReplyRequest | None = None) -> dict:
         return service.send_reply(thread_id, payload.body if payload else None)
+
+    @app.post("/api/threads/{thread_id}/reply/resolve", response_model=ThreadDetail)
+    def resolve_reply(thread_id: str, payload: ReplyResolutionRequest) -> dict:
+        return service.resolve_reply(thread_id, payload.delivered)
 
     @app.get("/api/requirements/{requirement_id}/markdown", response_model=MarkdownResponse)
     def get_requirement_markdown(requirement_id: str) -> dict[str, str]:

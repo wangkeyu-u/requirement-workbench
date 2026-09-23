@@ -25,6 +25,7 @@ export const api = {
   settings:()=>request<Settings>('/api/settings'),
   setAutoReply:(auto_reply:boolean)=>request<Settings>('/api/settings',{method:'PATCH',body:JSON.stringify({auto_reply})}),
   reply:(id:string)=>request<ThreadDetail>(`/api/threads/${encodeURIComponent(id)}/reply`,{method:'POST'}),
+  resolveReply:(id:string,delivered:boolean)=>request<ThreadDetail>(`/api/threads/${encodeURIComponent(id)}/reply/resolve`,{method:'POST',body:JSON.stringify({delivered})}),
   markdown:(id:string)=>request<{markdown:string}>(`/api/requirements/${encodeURIComponent(id)}/markdown`),
   attachment:(id:string,download=false)=>`${API_BASE}/api/attachments/${encodeURIComponent(id)}${download?'?download=true':''}`,
 };

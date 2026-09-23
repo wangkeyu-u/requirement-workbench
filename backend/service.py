@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -128,8 +129,24 @@ def _reply_from_row(row: Any) -> dict[str, Any]:
 
 
 class WorkbenchService:
+    STALE_SEND_AFTER = timedelta(minutes=5)
+
     def __init__(self, database: Database) -> None:
         self.db = database
+
+    def _mark_stale_sending(self, conn: Any, thread_id: str) -> None:
+        cutoff = (datetime.now(timezone.utc) - self.STALE_SEND_AFTER).isoformat(timespec="seconds")
+        conn.execute(
+            "UPDATE replies SET status = 'uncertain' WHERE thread_id = ? AND status = 'sending' AND created_at <= ?",
+            (thread_id, cutoff),
+        )
+
+    def _mark_reply_uncertain(self, reply_id: str) -> None:
+        with self.db.transaction() as conn:
+            conn.execute(
+                "UPDATE replies SET status = 'uncertain' WHERE id = ? AND status = 'sending'",
+                (reply_id,),
+            )
 
     def _settings_row(self, conn: Any) -> Any:
         row = conn.execute("SELECT * FROM settings WHERE id = 1").fetchone()
@@ -267,8 +284,8 @@ class WorkbenchService:
                     """
                     INSERT INTO emails(
                         id, thread_id, sender, sender_email, subject, body,
-                        received_at, direction, do_not_reply
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'inbound', 0)
+                        received_at, direction, do_not_reply, message_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'inbound', 0, ?)
                     """,
                     (
                         email_id,
@@ -278,6 +295,7 @@ class WorkbenchService:
                         message.subject,
                         message.body,
                         message.received_at,
+                        message.message_key if re.fullmatch(r"<[^<>\s]+>", message.message_key) else None,
                     ),
                 )
                 for index, attachment in enumerate(message.attachments):
@@ -302,6 +320,15 @@ class WorkbenchService:
                     )
                 imported += 1
                 touched_threads.add(thread_id)
+        # A fetched message must only become Seen after its local transaction commits.
+        # If marking fails, a later sync can safely import it again by message ID.
+        mailbox_uids = [message.mailbox_uid for message in messages if message.mailbox_uid]
+        mark_seen = getattr(provider, "mark_messages_seen", None)
+        if mailbox_uids and callable(mark_seen):
+            try:
+                mark_seen(mailbox_uids)
+            except MailProviderError as exc:
+                raise HTTPException(status_code=502, detail=f"Mail provider error: {exc}") from exc
         return {
             "provider": getattr(provider, "label", configured_provider),
             "fetched": len(messages),
@@ -356,6 +383,8 @@ class WorkbenchService:
         return [_model_safe_email(email) for email in self._get_emails(conn, thread_id)]
 
     def detail(self, thread_id: str) -> dict[str, Any]:
+        with self.db.transaction() as conn:
+            self._mark_stale_sending(conn, thread_id)
         with self.db.connection() as conn:
             thread = _thread_from_row(self._get_thread_row(conn, thread_id))
             requirement = _requirement_from_row(self._get_requirement_row(conn, thread_id), thread)
@@ -795,8 +824,8 @@ class WorkbenchService:
         is answered with 409 so the caller learns which rule stopped the send.
         """
 
-        if not _bool(settings["auto_reply"]):
-            return "Auto reply is disabled"
+        if str(settings["mail_provider"]).strip().lower() != "mock" and not thread["id"].startswith("mail-thread-"):
+            return "Demo threads cannot be sent through a real mailbox"
         if thread["do_not_reply"]:
             return "Thread is marked DO NOT REPLY"
         if conn.execute(
@@ -816,6 +845,8 @@ class WorkbenchService:
         if reply_row is not None:
             if reply_row["status"] == "sending":
                 return "A reply is already in progress for this thread"
+            if reply_row["status"] == "uncertain":
+                return "Confirm whether the previous reply was delivered before sending again"
             return "A reply was already sent for this thread"
         return None
 
@@ -868,11 +899,24 @@ class WorkbenchService:
             if duplicate is not None:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Duplicate reply blocked")
             latest_inbound = conn.execute(
-                "SELECT sender_email, subject FROM emails WHERE thread_id = ? AND direction = 'inbound' ORDER BY received_at DESC LIMIT 1",
+                "SELECT sender_email, subject, message_id FROM emails WHERE thread_id = ? AND direction = 'inbound' ORDER BY received_at DESC LIMIT 1",
+                (thread_id,),
+            ).fetchone()
+            root_inbound = conn.execute(
+                "SELECT message_id FROM emails WHERE thread_id = ? AND direction = 'inbound' AND message_id IS NOT NULL ORDER BY received_at ASC LIMIT 1",
                 (thread_id,),
             ).fetchone()
             recipient = latest_inbound["sender_email"] if latest_inbound else latest_thread["sender"]
             subject = latest_inbound["subject"] if latest_inbound else latest_thread["subject"]
+            reply_to_message_id = latest_inbound["message_id"] if latest_inbound else None
+            references = list(dict.fromkeys(
+                item for item in (
+                    root_inbound["message_id"] if root_inbound else None,
+                    reply_to_message_id,
+                ) if item
+            ))
+            latest_thread["reply_to_message_id"] = reply_to_message_id
+            latest_thread["references"] = references
             outbound_sender_email = str(getattr(mail, "from_address", "me@localhost") or "me@localhost")
             outbound_sender = "Requirement Workbench" if getattr(mail, "label", "mock") == "mock" else outbound_sender_email
             conn.execute(
@@ -891,25 +935,32 @@ class WorkbenchService:
                 body=body,
             )
         except MailProviderError as exc:
-            with self.db.transaction() as conn:
-                conn.execute("DELETE FROM replies WHERE id = ? AND status = 'sending'", (reply_id,))
+            self._mark_reply_uncertain(reply_id)
             raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Mail provider error: {exc}") from exc
+        except Exception as exc:
+            self._mark_reply_uncertain(reply_id)
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Mail provider error: send result is unknown; check the sent mailbox before retrying",
+            ) from exc
 
         with self.db.transaction() as conn:
             latest_thread = _thread_from_row(self._get_thread_row(conn, thread_id))
             latest_requirement = self._get_requirement_row(conn, thread_id)
             latest_state = _requirement_from_row(latest_requirement, latest_thread)
-            conn.execute(
+            updated = conn.execute(
                 "UPDATE replies SET status = 'sent', provider_message_id = ? WHERE id = ? AND status = 'sending'",
                 (provider_message_id, reply_id),
             )
+            if updated.rowcount != 1:
+                raise RuntimeError("Reply reservation changed while the provider was sending")
             outbound_id = f"email-{reply_id}"
             conn.execute(
                 """
                 INSERT INTO emails(
                     id, thread_id, sender, sender_email, subject, body,
-                    received_at, direction, do_not_reply
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'outbound', 0)
+                    received_at, direction, do_not_reply, message_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'outbound', 0, ?)
                 """,
                 (
                     outbound_id,
@@ -919,6 +970,7 @@ class WorkbenchService:
                     f"Re: {subject.removeprefix('Re: ').strip()}",
                     body,
                     created_at,
+                    provider_message_id,
                 ),
             )
             latest_state["status"] = "replied"
@@ -930,6 +982,61 @@ class WorkbenchService:
                 "UPDATE threads SET status = 'replied', updated_at = ? WHERE id = ?",
                 (created_at, thread_id),
             )
+        return self.detail(thread_id)
+
+    def resolve_reply(self, thread_id: str, delivered: bool) -> dict[str, Any]:
+        """Let the user reconcile an SMTP result after checking the sent mailbox."""
+
+        with self.db.transaction() as conn:
+            thread = _thread_from_row(self._get_thread_row(conn, thread_id))
+            self._mark_stale_sending(conn, thread_id)
+            reply = conn.execute(
+                "SELECT * FROM replies WHERE thread_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+                (thread_id,),
+            ).fetchone()
+            if reply is None or reply["status"] != "uncertain":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="No uncertain reply is waiting for confirmation",
+                )
+            if not delivered:
+                conn.execute("DELETE FROM replies WHERE id = ?", (reply["id"],))
+            else:
+                now = utc_now()
+                conn.execute(
+                    "UPDATE replies SET status = 'sent', provider_message_id = COALESCE(provider_message_id, 'manually-confirmed') WHERE id = ?",
+                    (reply["id"],),
+                )
+                latest_inbound = conn.execute(
+                    "SELECT subject FROM emails WHERE thread_id = ? AND direction = 'inbound' ORDER BY received_at DESC LIMIT 1",
+                    (thread_id,),
+                ).fetchone()
+                subject = latest_inbound["subject"] if latest_inbound else thread["subject"]
+                configured_mail = str(self._settings_row(conn)["mail_provider"]).strip().lower()
+                sender = "Requirement Workbench" if configured_mail == "mock" else "我"
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO emails(
+                        id, thread_id, sender, sender_email, subject, body,
+                        received_at, direction, do_not_reply
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'outbound', 0)
+                    """,
+                    (
+                        f"email-{reply['id']}", thread_id, sender, "",
+                        f"Re: {subject.removeprefix('Re: ').strip()}", reply["body"], now,
+                    ),
+                )
+                requirement_row = self._get_requirement_row(conn, thread_id)
+                state = _requirement_from_row(requirement_row, thread)
+                state["status"] = "replied"
+                conn.execute(
+                    "UPDATE requirements SET state_json = ?, status = 'replied', updated_at = ? WHERE thread_id = ?",
+                    (json_dumps(state), now, thread_id),
+                )
+                conn.execute(
+                    "UPDATE threads SET status = 'replied', updated_at = ? WHERE id = ?",
+                    (now, thread_id),
+                )
         return self.detail(thread_id)
 
     def requirement_markdown(self, requirement_id: str) -> str:

@@ -3,6 +3,7 @@
 import { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import type { Settings, Thread } from '../lib/api';
 import { api } from '../lib/api';
+import { errorLabel } from '../lib/i18n';
 import { InfiniteWorkspace, type WorkbenchShellProps } from '../components/spatial/InfiniteWorkspace';
 import WorkbenchShell from '../components/workbench/WorkbenchShell';
 import { DEMO_THREADS } from '../components/spatial/demoData';
@@ -10,17 +11,7 @@ import { DEMO_THREADS } from '../components/spatial/demoData';
 const RefreshContext = createContext<() => void>(() => {});
 
 function friendlyError(error: unknown, fallback: string): string {
-  const message = error instanceof Error ? error.message : '';
-  if (!message || /failed to fetch|networkerror|load failed/i.test(message)) return fallback;
-  if (/^Mail provider error:/i.test(message)) {
-    if (/configuration is incomplete/i.test(message)) return '邮箱同步失败：邮箱配置不完整，请检查 backend/.env。';
-    if (/SMTP send failed/i.test(message)) return '邮件发送失败：请检查 SMTP 地址、端口和账号配置。';
-    return '邮箱同步失败：请检查 IMAP 地址、端口、账号和密码配置。';
-  }
-  if (/^LLM provider error:/i.test(message)) {
-    return 'DeepSeek 调用失败：请检查 API Key、模型和网络配置。';
-  }
-  return message;
+  return errorLabel(error, fallback);
 }
 
 function ConnectedWorkbench({ threadId, onClose }: WorkbenchShellProps) {
