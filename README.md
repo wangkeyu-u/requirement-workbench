@@ -1,6 +1,8 @@
-# Requirement Workbench
+# Requirement Workbench（Demo）
 
-个人本地 AI 邮件需求工作台。首页为空间玻璃卡片，进入后处理邮件、逐项澄清需求并导出 Markdown。
+**项目状态：Demo / MVP。** 这是一个在本地运行的 AI 邮件需求工作台演示项目，用于展示从邮件整理、逐项澄清需求到导出 Markdown 的最小流程；本仓库不提供线上服务。默认的 10 条邮件线程、AI 分析和发信均使用 Mock 数据，模拟回复不会寄出真实邮件。
+
+首页为空间玻璃卡片，进入后可以查看邮件、逐项澄清需求并导出 Markdown。真实 IMAP/SMTP 邮箱和 DeepSeek 是可选的本地配置；代码提供接入链路，但尚未使用真实账号完成联机验收，不应把默认演示结果理解为真实邮件或真实模型的运行结果。
 
 界面使用简体中文；邮件主题、正文、发件人和附件文件名保持邮件原来的语言。
 
@@ -46,5 +48,7 @@ cd frontend
 npm run typecheck
 npm run build
 ```
+
+启动前端后，在项目根目录运行 `bash scripts/smoke.sh`，可检查临时 Mock 数据库的后端接口和中文首页；如果前端未启动，脚本会明确提示跳过前端检查。
 
 产品需求见 `docs/PRODUCT.md`，历史 HTTP 契约见 `docs/API_CONTRACT.md`。
