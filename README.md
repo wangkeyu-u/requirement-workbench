@@ -51,4 +51,4 @@ npm run build
 
 启动前端后，在项目根目录运行 `bash scripts/smoke.sh`，可检查临时 Mock 数据库的后端接口和中文首页；如果前端未启动，脚本会明确提示跳过前端检查。
 
-产品需求见 `docs/PRODUCT.md`，历史 HTTP 契约见 `docs/API_CONTRACT.md`。
+服务端数据流与发信约束见[架构说明](docs/architecture.md)，接口见[HTTP 契约](docs/API_CONTRACT.md)，已执行的检查见[验收记录](docs/ACCEPTANCE.md)。
