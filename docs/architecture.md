@@ -33,7 +33,8 @@ identifiers are excluded. The download API and the model input are separate path
 
 ## Reply authorization
 
-`_reply_blocker` checks the stored settings and thread state before sending:
+`send_reply` enforces the following checks against stored settings and state;
+thread-level blockers are centralized in `_reply_blocker`:
 
 - Demo threads cannot be sent through a real mailbox.
 - Thread-level and message-level DO NOT REPLY must both be clear.
