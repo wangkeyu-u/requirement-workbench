@@ -91,7 +91,7 @@ MODEL_SAFE_ATTACHMENT_FIELDS = ("filename", "content_type", "size")
 def _model_safe_email(email: dict[str, Any]) -> dict[str, Any]:
     """Drop everything a model must not see.
 
-    PRODUCT.md section 12 forbids the AI from reading attachment contents, so the
+    docs/architecture.md excludes attachment contents from model input, so the
     projection is enforced here instead of relying on callers to behave.
     """
 
@@ -820,7 +820,7 @@ class WorkbenchService:
     def _reply_blocker(self, conn: Any, thread: dict[str, Any], settings: Any) -> str | None:
         """Return the first reason this thread must not send, or None when it may.
 
-        Every entry maps to a documented guardrail (PRODUCT.md sections 6 and 12) and
+        Every entry maps to a guardrail in docs/architecture.md and
         is answered with 409 so the caller learns which rule stopped the send.
         """
 
